@@ -87,6 +87,86 @@ app.get("/", (req, res) => {
 //   }
 // });
 
+// app.post("/payments", async (req, res) => {
+//   try {
+//     const idempotencyKey = req.headers["idempotency-key"];
+
+//     if (!idempotencyKey) {
+//       return res.status(400).json({
+//         error: "Idempotency-Key header is required"
+//       });
+//     }
+
+//     const { amount, currency = "NGN" } = req.body;
+
+//     if (
+//       amount === undefined ||
+//       !Number.isInteger(amount) ||
+//       amount <= 0
+//     ) {
+//       return res.status(400).json({
+//         error: "Amount must be a positive integer"
+//       });
+//     }
+
+//     const id = crypto.randomUUID();
+//     const reference = `PAY-${crypto.randomUUID()}`;
+
+//     const result = await pool.query(
+//       `
+//       INSERT INTO payments
+//       (id, reference, amount_minor, currency, status, idempotency_key)
+//       VALUES ($1, $2, $3, $4, $5, $6)
+//       ON CONFLICT (idempotency_key) DO NOTHING
+//       RETURNING *
+//       `,
+//       [
+//         id,
+//         reference,
+//         amount,
+//         currency,
+//         "PENDING",
+//         idempotencyKey
+//       ]
+//     );
+
+//     // Payment already existed
+//     if (result.rows.length === 0) {
+//       const existingPayment = await pool.query(
+//         `
+//         SELECT *
+//         FROM payments
+//         WHERE idempotency_key = $1
+//         `,
+//         [idempotencyKey]
+//       );
+
+//       return res.status(200).json({
+//         message: "Payment already exists",
+//         payment: existingPayment.rows[0]
+//       });
+//     }
+
+//     return res.status(201).json({
+//       message: "Payment created",
+//       payment: result.rows[0]
+//     });
+
+//   } catch (error) {
+//     console.error(error);
+
+//     return res.status(500).json({
+//       error: "Failed to create payment"
+//     });
+//   }
+// });
+function createRequestHash(amount, currency) {
+  return crypto
+    .createHash("sha256")
+    .update(`${amount}:${currency}`)
+    .digest("hex");
+}
+
 app.post("/payments", async (req, res) => {
   try {
     const idempotencyKey = req.headers["idempotency-key"];
@@ -109,14 +189,16 @@ app.post("/payments", async (req, res) => {
       });
     }
 
+    const requestHash = createRequestHash(amount, currency);
+
     const id = crypto.randomUUID();
     const reference = `PAY-${crypto.randomUUID()}`;
 
     const result = await pool.query(
       `
       INSERT INTO payments
-      (id, reference, amount_minor, currency, status, idempotency_key)
-      VALUES ($1, $2, $3, $4, $5, $6)
+      (id, reference, amount_minor, currency, status, idempotency_key, request_hash)
+      VALUES ($1, $2, $3, $4, $5, $6, $7)
       ON CONFLICT (idempotency_key) DO NOTHING
       RETURNING *
       `,
@@ -126,30 +208,42 @@ app.post("/payments", async (req, res) => {
         amount,
         currency,
         "PENDING",
-        idempotencyKey
+        idempotencyKey,
+        requestHash
       ]
     );
 
-    // Payment already existed
-    if (result.rows.length === 0) {
-      const existingPayment = await pool.query(
-        `
-        SELECT *
-        FROM payments
-        WHERE idempotency_key = $1
-        `,
-        [idempotencyKey]
-      );
-
-      return res.status(200).json({
-        message: "Payment already exists",
-        payment: existingPayment.rows[0]
+    // New payment
+    if (result.rows.length > 0) {
+      return res.status(201).json({
+        message: "Payment created",
+        payment: result.rows[0]
       });
     }
 
-    return res.status(201).json({
-      message: "Payment created",
-      payment: result.rows[0]
+    // Existing payment
+    const existingPayment = await pool.query(
+      `
+      SELECT *
+      FROM payments
+      WHERE idempotency_key = $1
+      `,
+      [idempotencyKey]
+    );
+
+    const payment = existingPayment.rows[0];
+
+    // Same key, different request
+    if (payment.request_hash !== requestHash) {
+      return res.status(409).json({
+        error: "Idempotency key was already used with a different request"
+      });
+    }
+
+    // Same key, same request
+    return res.status(200).json({
+      message: "Payment already exists",
+      payment
     });
 
   } catch (error) {
