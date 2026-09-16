@@ -12,38 +12,55 @@ app.get("/", (req, res) => {
   });
 });
 
-app.post("/payments", async (req, res) => {
-  const idempotencyKey = req.headers["idempotency-key"];
 
-   if (!idempotencyKey) {
+app.post("/payments", async (req, res) => {
+  try {
+    const idempotencyKey = req.headers["idempotency-key"];
+
+    if (!idempotencyKey) {
       return res.status(400).json({
         error: "Idempotency-Key header is required"
       });
     }
 
-  try {
     const { amount, currency = "NGN" } = req.body;
 
-    // Validate amount
     if (
       amount === undefined ||
       !Number.isInteger(amount) ||
       amount <= 0
     ) {
       return res.status(400).json({
-        error: "Amount must be a positive integer in minor currency units"
+        error: "Amount must be a positive integer"
       });
     }
 
-    // Generate unique identifiers
+    // Check whether this request was already processed
+    const existingPayment = await pool.query(
+      `
+      SELECT *
+      FROM payments
+      WHERE idempotency_key = $1
+      `,
+      [idempotencyKey]
+    );
+
+    if (existingPayment.rows.length > 0) {
+      return res.status(200).json({
+        message: "Payment already exists",
+        payment: existingPayment.rows[0]
+      });
+    }
+
     const id = crypto.randomUUID();
+
     const reference = `PAY-${crypto.randomUUID()}`;
 
     const result = await pool.query(
       `
       INSERT INTO payments
-      (id, reference, amount_minor, currency, status)
-      VALUES ($1, $2, $3, $4, $5)
+      (id, reference, amount_minor, currency, status, idempotency_key)
+      VALUES ($1, $2, $3, $4, $5, $6)
       RETURNING *
       `,
       [
@@ -51,11 +68,15 @@ app.post("/payments", async (req, res) => {
         reference,
         amount,
         currency,
-        "PENDING"
+        "PENDING",
+        idempotencyKey
       ]
     );
 
-    return res.status(201).json(result.rows[0]);
+    return res.status(201).json({
+      message: "Payment created",
+      payment: result.rows[0]
+    });
 
   } catch (error) {
     console.error(error);
